@@ -1,0 +1,227 @@
+-- Debug helper for RecieveCoin / related remotes
+-- SAFE: This script only inspects objects and prints them.
+-- Set ALLOW_TEST_SEND = true if you explicitly want a single test FireServer (not recommended without understanding).
+local ALLOW_TEST_SEND = false -- change to true only if you want one guarded test send
+local TEST_SENDS = 1          -- number of test fires if ALLOW_TEST_SEND true
+
+local EXPECTED_PLACEID = 131667667758514
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local LocalPlayer = Players.LocalPlayer
+
+local function notify(title, text, duration)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title or "Debug",
+            Text = text or "",
+            Duration = duration or 5
+        })
+    end)
+end
+
+local function safeWaitFor(parent, name, timeout)
+    timeout = timeout or 9e9
+    local ok, result = pcall(function() return parent:WaitForChild(name, timeout) end)
+    if ok then return result end
+    return nil
+end
+
+local function serializeValue(v)
+    if typeof(v) == "Instance" then
+        return string.format("Instance(%s) name=%s Class=%s", v:GetFullName(), v.Name, v.ClassName)
+    else
+        return tostring(v)
+    end
+end
+
+local function printTree(root, depth, visited)
+    depth = depth or 0
+    visited = visited or {}
+    local indent = string.rep("  ", depth)
+    if typeof(root) == "Instance" then
+        print(string.format("%s- %s [%s]", indent, root.Name, root.ClassName))
+        if visited[root] then
+            print(indent.."  (already shown)")
+            return
+        end
+        visited[root] = true
+        for _, child in ipairs(root:GetChildren()) do
+            printTree(child, depth + 1, visited)
+        end
+        -- show values for common value objects
+        if root:IsA("ObjectValue") or root:IsA("IntValue") or root:IsA("NumberValue")
+            or root:IsA("BoolValue") or root:IsA("StringValue") then
+            print(indent.."  -> Value: "..serializeValue(root.Value))
+        end
+    else
+        print(indent.."- "..tostring(root))
+    end
+end
+
+local function findRemotes()
+    local remotes = {}
+    local ok, r = pcall(function() return ReplicatedStorage:FindFirstChild("Remotes") end)
+    if not ok or not r then
+        return remotes
+    end
+    for _, v in ipairs(r:GetChildren()) do
+        if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then
+            remotes[v.Name] = v
+        end
+    end
+    return remotes
+end
+
+local function isPlayerDriverOfJeep(jeepInstance)
+    if not jeepInstance then return false, "Jeep instance nil" end
+    -- heuristic: check for a VehicleSeat or driver value inside the jeep
+    for _, child in ipairs(jeepInstance:GetDescendants()) do
+        if child:IsA("VehicleSeat") then
+            local occupant = child.Occupant
+            if occupant and occupant.Parent then
+                local human = Players:GetPlayerFromCharacter(occupant.Parent)
+                if human == LocalPlayer then
+                    return true, "Player is seated in VehicleSeat '"..child.Name.."'"
+                else
+                    return false, "Seat occupied by other player"
+                end
+            end
+        end
+        -- some games store a driver ObjectValue or BoolValue - check common names
+        if child:IsA("ObjectValue") and (child.Name:lower():find("driver") or child.Name:lower():find("owner")) then
+            if child.Value and typeof(child.Value) == "Instance" and child.Value:IsDescendantOf(LocalPlayer.Character or workspace) then
+                return true, "Driver ObjectValue points to local player"
+            end
+        end
+    end
+    return false, "No driver/seat found or player not driver"
+end
+
+-- Start main
+print("=== Jeepney Remote Debugger ===")
+if game.PlaceId ~= EXPECTED_PLACEID then
+    local msg = string.format("PlaceId mismatch: got %s expected %s", tostring(game.PlaceId), tostring(EXPECTED_PLACEID))
+    print(msg)
+    notify("Debug - Wrong Place", msg, 6)
+    -- continue anyway in case you want to debug in another place
+end
+
+local remotes = findRemotes()
+print("Found remotes in ReplicatedStorage.Remotes:")
+for name, _ in pairs(remotes) do
+    print("  - " .. name)
+end
+notify("Debug", "Found " .. tostring((function() local c=0; for _ in pairs(remotes) do c=c+1 end; return c end)()) .. " remotes", 4)
+
+-- attempt to locate Jeepnies -> BSKL_Wow -> PassengerValues
+local jeepnies = workspace:FindFirstChild("Jeepnies")
+if not jeepnies then
+    print("workspace.Jeepnies not found.")
+    notify("Debug", "workspace.Jeepnies not found", 5)
+else
+    local jeep = jeepnies:FindFirstChild("BSKL_Wow")
+    if not jeep then
+        print("Jeep 'BSKL_Wow' not found under workspace.Jeepnies.")
+        notify("Debug", "Jeep 'BSKL_Wow' not found", 5)
+    else
+        print("Found Jeep: "..jeep:GetFullName())
+        -- Print a tree for the Jeep (limited depth by printing only children)
+        print("Structure under Jeep (first-level children):")
+        for _, child in ipairs(jeep:GetChildren()) do
+            print("  - "..child.Name.." ("..child.ClassName..")")
+        end
+
+        -- PassengerValues may be a folder or instance
+        local pv = jeep:FindFirstChild("PassengerValues")
+        if not pv then
+            print("PassengerValues not found under the jeep.")
+            notify("Debug", "PassengerValues not found", 5)
+        else
+            print("PassengerValues contents:")
+            printTree(pv)
+            notify("Debug", "PassengerValues printed to console", 5)
+        end
+
+        -- Driver check
+        local isDriver, reason = isPlayerDriverOfJeep(jeep)
+        print("Driver check:", isDriver, reason)
+        if isDriver then
+            notify("Debug", "You appear to be the driver", 4)
+        else
+            notify("Debug", "Not driver: "..reason, 6)
+        end
+    end
+end
+
+-- Show a safe summary of expected remotes of interest
+local interest = {"RecieveCoin", "RecieveOnHoldCash", "RecieveCash"}
+for _, name in ipairs(interest) do
+    if remotes[name] then
+        print("Remote '"..name.."' FOUND. Full name: "..remotes[name]:GetFullName())
+    else
+        print("Remote '"..name.."' NOT found.")
+    end
+end
+
+-- Optional guarded test sends (disabled by default)
+if ALLOW_TEST_SEND then
+    print("ALLOW_TEST_SEND enabled: attempting up to "..tostring(TEST_SENDS).." test sends (guarded).")
+    notify("Debug", "ALLOW_TEST_SEND enabled. Check console for results.", 6)
+    -- Example safe payloads observed (use with caution)
+    local safePayloads = {
+        RecieveOnHoldCash = {
+            [1] = { ["Value"] = 20, ["Password"] = 23063555 }
+        },
+        RecieveCoin = function(pv)
+            return {
+                [1] = {
+                    ["PassengerValues"] = pv,
+                    ["Password"] = 23063555,
+                    ["Main"] = true,
+                    ["Value"] = 20
+                }
+            }
+        end
+    }
+
+    local rem = remotes -- local ref
+    local pv = nil
+    if workspace:FindFirstChild("Jeepnies") and workspace.Jeepnies:FindFirstChild("BSKL_Wow") then
+        pv = workspace.Jeepnies.BSKL_Wow:FindFirstChild("PassengerValues")
+    end
+
+    for i = 1, TEST_SENDS do
+        -- try RecieveOnHoldCash if present
+        if rem["RecieveOnHoldCash"] then
+            local ok, err = pcall(function()
+                rem["RecieveOnHoldCash"]:FireServer(safePayloads.RecieveOnHoldCash)
+            end)
+            print("Test send RecieveOnHoldCash attempt #"..i..":", ok, err or "no error")
+        else
+            print("RecieveOnHoldCash not present; skipping test send.")
+        end
+
+        -- try RecieveCoin if present and we have pv
+        if rem["RecieveCoin"] and pv then
+            local payload = safePayloads.RecieveCoin(pv)
+            local ok, err = pcall(function()
+                rem["RecieveCoin"]:FireServer(unpack(payload))
+            end)
+            print("Test send RecieveCoin attempt #"..i..":", ok, err or "no error")
+        else
+            print("RecieveCoin not present or PassengerValues nil; skipping RecieveCoin test send.")
+        end
+
+        task.wait(0.2)
+    end
+
+    notify("Debug", "Test sends completed. See console.", 6)
+else
+    print("ALLOW_TEST_SEND is false. No test sends performed.")
+    print("If you want a single test send, set ALLOW_TEST_SEND = true at the top of this script (use responsibly).")
+end
+
+print("=== Debug complete ===")
+notify("Debug", "Complete — check Output window", 5)
