@@ -1,0 +1,233 @@
+-- Jeepney Monitor + Debugger (safe by default)
+-- Purpose: watch PassengerValues and driver state; optionally do 1 guarded test send.
+local ALLOW_TEST_SEND = true  -- set to true only if you explicitly want one test send
+local TEST_SEND_COUNT = 1       -- number of test sends if ALLOW_TEST_SEND true
+local EXPECTED_PLACEID = 131667667758514
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+local function notify(title, text, duration)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title,
+            Text = tostring(text),
+            Duration = duration or 5
+        })
+    end)
+end
+
+local function safeFindRemotes()
+    local rems = {}
+    local ok, remFolder = pcall(function() return ReplicatedStorage:FindFirstChild("Remotes") end)
+    if not ok or not remFolder then return rems end
+    for _, r in ipairs(remFolder:GetChildren()) do
+        if r:IsA("RemoteEvent") or r:IsA("RemoteFunction") then
+            rems[r.Name] = r
+        end
+    end
+    return rems
+end
+
+local function printPassengerValues(pv)
+    if not pv then
+        print("PassengerValues: nil")
+        return
+    end
+    print("=== PassengerValues contents ===")
+    for _, child in ipairs(pv:GetChildren()) do
+        local cName = child.Name
+        local cClass = child.ClassName
+        local val = nil
+        if child:IsA("IntValue") or child:IsA("NumberValue") or child:IsA("StringValue")
+           or child:IsA("BoolValue") or child:IsA("ObjectValue") then
+            val = child.Value
+        else
+            val = "<"..cClass..">"
+        end
+        print(string.format(" - %s (%s) = %s", cName, cClass, tostring(val)))
+    end
+    print("=== end PassengerValues ===")
+end
+
+local function isLocalPlayerDriver(jeep)
+    if not jeep then return false, "jeep nil" end
+    -- check for VehicleSeat
+    for _, v in ipairs(jeep:GetDescendants()) do
+        if v:IsA("VehicleSeat") then
+            local occ = v.Occupant
+            if occ and occ.Parent then
+                local p = Players:GetPlayerFromCharacter(occ.Parent)
+                if p == LocalPlayer then
+                    return true, "Seated in VehicleSeat: "..v:GetFullName()
+                else
+                    return false, "Seat occupied by other player: "..tostring(p and p.Name or "unknown")
+                end
+            end
+        end
+    end
+    return false, "No VehicleSeat occupant found"
+end
+
+-- Attempt to locate Jeep + PassengerValues
+local jeepnies = workspace:FindFirstChild("Jeepnies")
+if not jeepnies then
+    print("workspace.Jeepnies NOT found.")
+    notify("Jeep Monitor", "workspace.Jeepnies not found", 6)
+else
+    print("workspace.Jeepnies found.")
+end
+
+local jeep = (jeepnies and jeepnies:FindFirstChild("BSKL_Wow")) or nil
+if not jeep then
+    print("Jeep 'BSKL_Wow' NOT found under workspace.Jeepnies.")
+    notify("Jeep Monitor", "Jeep 'BSKL_Wow' not found", 6)
+else
+    print("Jeep found:", jeep:GetFullName())
+end
+
+local remotes = safeFindRemotes()
+print("Remotes found in ReplicatedStorage.Remotes:")
+for n,_ in pairs(remotes) do print(" - "..n) end
+notify("Jeep Monitor", "Remotes found: "..tostring((function() local c=0; for _ in pairs(remotes) do c=c+1 end; return c end)()), 4)
+
+-- get PassengerValues (watch for it being added later)
+local PassengerValues = nil
+if jeep then
+    PassengerValues = jeep:FindFirstChild("PassengerValues")
+end
+
+-- function to attach listeners to PassengerValues to log changes
+local function attachPVListeners(pv)
+    if not pv then return end
+    print("Attaching listeners to PassengerValues...")
+    -- initial print
+    printPassengerValues(pv)
+
+    -- child added / removed
+    pv.ChildAdded:Connect(function(child)
+        print("PassengerValues ChildAdded:", child.Name, child.ClassName)
+        if child:IsA("IntValue") or child:IsA("NumberValue") or child:IsA("StringValue")
+           or child:IsA("BoolValue") or child:IsA("ObjectValue") then
+            print(" -> initial value:", tostring(child.Value))
+            child.Changed:Connect(function(new)
+                print(("PassengerValues %s changed to: %s"):format(child.Name, tostring(new)))
+            end)
+        end
+    end)
+
+    pv.ChildRemoved:Connect(function(child)
+        print("PassengerValues ChildRemoved:", child.Name, child.ClassName)
+    end)
+
+    -- attach Changed listeners to current children
+    for _, ch in ipairs(pv:GetChildren()) do
+        if ch:IsA("IntValue") or ch:IsA("NumberValue") or ch:IsA("StringValue")
+           or ch:IsA("BoolValue") or ch:IsA("ObjectValue") then
+            ch.Changed:Connect(function(new)
+                print(("PassengerValues %s changed to: %s"):format(ch.Name, tostring(new)))
+            end)
+        end
+    end
+end
+
+-- If PassengerValues exists now, attach listeners; otherwise watch for it
+if PassengerValues then
+    attachPVListeners(PassengerValues)
+else
+    if jeep then
+        jeep.ChildAdded:Connect(function(child)
+            if child.Name == "PassengerValues" then
+                PassengerValues = child
+                attachPVListeners(child)
+                notify("Jeep Monitor", "PassengerValues appeared; attached listeners", 4)
+            end
+        end)
+    end
+end
+
+-- Watch for seat occupancy changes and notify when you become driver
+local lastDriverState = false
+local function checkDriver()
+    if not jeep then return end
+    local isDriver, reason = isLocalPlayerDriver(jeep)
+    if isDriver ~= lastDriverState then
+        lastDriverState = isDriver
+        if isDriver then
+            print("Driver status: YOU are driver. Reason:", reason)
+            notify("Jeep Monitor", "You are driver", 4)
+        else
+            print("Driver status: Not driver. Reason:", reason)
+            notify("Jeep Monitor", "Not driver: "..reason, 5)
+        end
+    end
+end
+
+-- Polling driver/PassengerValues summary every 1s (lightweight)
+spawn(function()
+    while true do
+        if jeep then
+            checkDriver()
+            if PassengerValues then
+                -- print short summary: child count and look for common keys
+                local count = #PassengerValues:GetChildren()
+                local summary = "PassengerValues child count: "..count
+                -- attempt to find numeric-like keys (Count, Passengers, Received, Sent)
+                for _, ch in ipairs(PassengerValues:GetChildren()) do
+                    if (ch:IsA("IntValue") or ch:IsA("NumberValue")) and (ch.Name:lower():find("count") or ch.Name:lower():find("pass")) then
+                        summary = summary .. " | " .. ch.Name .. "=" .. tostring(ch.Value)
+                    end
+                end
+                print(summary)
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- Optional guarded test send (user must opt in)
+if ALLOW_TEST_SEND then
+    warn("ALLOW_TEST_SEND = true. Preparing guarded test sends. Make sure you understand what this will do.")
+    notify("Jeep Monitor", "ALLOW_TEST_SEND enabled. Will attempt "..TEST_SEND_COUNT.." test sends.", 6)
+
+    local function safeFire(remote, payload)
+        local ok, err = pcall(function()
+            if typeof(payload) == "table" then
+                remote:FireServer(unpack(payload))
+            else
+                remote:FireServer(payload)
+            end
+        end)
+        print("Test send to "..remote.Name.." -> success:", ok, "err:", tostring(err))
+    end
+
+    spawn(function()
+        for i = 1, TEST_SEND_COUNT do
+            -- prefer RecieveOnHoldCash if present (observed payload in your dump)
+            if remotes["RecieveOnHoldCash"] then
+                local p = { [1] = { ["Value"] = 20; ["Password"] = 23063555; } }
+                safeFire(remotes["RecieveOnHoldCash"], p)
+            end
+
+            if remotes["RecieveCoin"] and PassengerValues then
+                local p = { [1] = {
+                    ["PassengerValues"] = PassengerValues,
+                    ["Password"] = 23063555,
+                    ["Main"] = true,
+                    ["Value"] = 20
+                } }
+                safeFire(remotes["RecieveCoin"], p)
+            end
+
+            task.wait(0.25)
+        end
+        notify("Jeep Monitor", "Test sends completed. Check Output for results.", 6)
+    end)
+else
+    print("ALLOW_TEST_SEND is false. No test sends will be performed.")
+end
+
+print("Jeep Monitor running. Watch Output for PassengerValues changes and driver state.")
